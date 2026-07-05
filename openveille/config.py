@@ -18,7 +18,7 @@ BOAMP_URL = "https://www.boamp.fr/api/explore/v2.1/catalog/datasets/boamp/record
 
 # Pipeline defaults (déterminés lors du test embeddings + rerank)
 DEFAULT_TOP_K_RERANK = 30       # nb d'AO envoyés au LLM par profil
-DEFAULT_NOTIF_THRESHOLD = 70    # seuil LLM pour marquer pépite (validé sur golden set)
+DEFAULT_NOTIF_THRESHOLD = 80    # seuil LLM pour marquer pépite (validé sur golden set)
 MIN_DESC_LENGTH = 400           # skip AO squelette
 
 # Concurrence
