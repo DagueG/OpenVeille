@@ -1,36 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-OpenVeille - Backend FastAPI (read-only).
+OpenVeille - Backend FastAPI.
 
-Sert le frontend thecoloss.com :
-- GET /health                       → liveness probe
-- GET /profiles                     → liste des profils démo disponibles
-- GET /stats                        → stats globales pour la home (nb AO, pépites, etc.)
-- GET /pepites/{profile_name}       → pépites d'un profil sur une fenêtre temporelle
-
-Design :
-- Lecture seule vers Supabase via service_role (pas de mutation ici)
-- Cache mémoire simple avec TTL (les données changent peu, on évite de spammer Supabase)
-- CORS ouvert sur thecoloss.com + localhost dev
+Endpoints :
+- GET  /health                       → liveness probe
+- GET  /profiles                     → profils démo (pour référence, non utilisé par le front)
+- GET  /stats                        → stats globales des profils démo (facultatif)
+- POST /match                        → matching à la volée : description libre → pépites
 """
 import os
 import sys
 import time
 import logging
+from hashlib import sha256
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Le module openveille est un cran plus haut
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from openveille.db import get_client  # noqa: E402
+from openveille.db import get_client, match_ao_by_embedding  # noqa: E402
+from openveille.matcher import embed_texts, rerank_llm_from_db_candidates  # noqa: E402
 from openveille.profiles import PROFILES  # noqa: E402
+from openveille.config import DEFAULT_NOTIF_THRESHOLD  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,10 +40,9 @@ log = logging.getLogger("api")
 app = FastAPI(
     title="OpenVeille API",
     description="Veille sémantique des marchés publics — API du portfolio thecoloss.com",
-    version="0.1.0",
+    version="0.2.0",
 )
 
-# CORS : autoriser le frontend + le dev local Vite (5173)
 ALLOWED_ORIGINS = [
     "https://thecoloss.com",
     "https://www.thecoloss.com",
@@ -55,33 +52,55 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 
-# ---------- Cache mémoire ultra-simple ----------
+# ---------- Cache TTL simple ----------
 class TTLCache:
-    """Cache dict + TTL. Suffisant pour un backend mono-instance sur Railway/Render."""
-    def __init__(self, ttl_seconds: int = 60):
-        self.ttl = ttl_seconds
-        self.store: dict[str, tuple[float, object]] = {}
+    def __init__(self, default_ttl: int = 60):
+        self.default_ttl = default_ttl
+        self.store: dict[str, tuple[float, int, object]] = {}
 
     def get(self, key: str):
         entry = self.store.get(key)
         if not entry:
             return None
-        ts, value = entry
-        if time.time() - ts > self.ttl:
+        ts, ttl, value = entry
+        if time.time() - ts > ttl:
             self.store.pop(key, None)
             return None
         return value
 
-    def set(self, key: str, value):
-        self.store[key] = (time.time(), value)
+    def set(self, key: str, value, ttl: int | None = None):
+        self.store[key] = (time.time(), ttl or self.default_ttl, value)
 
 
-CACHE = TTLCache(ttl_seconds=60)
+CACHE = TTLCache(default_ttl=60)
+
+
+# ---------- Rate limiter mémoire (par IP) ----------
+class RateLimiter:
+    def __init__(self, max_requests: int, window_seconds: int):
+        self.max = max_requests
+        self.window = window_seconds
+        self.log: dict[str, list[float]] = {}
+
+    def check_and_add(self, key: str) -> tuple[bool, int]:
+        """Retourne (autorisé, temps_avant_reset_seconds)."""
+        now = time.time()
+        recent = [t for t in self.log.get(key, []) if now - t < self.window]
+        if len(recent) >= self.max:
+            oldest = min(recent)
+            return False, int(self.window - (now - oldest))
+        recent.append(now)
+        self.log[key] = recent
+        return True, 0
+
+
+MATCH_LIMITER = RateLimiter(max_requests=5, window_seconds=3600)
+
 _supabase = get_client()
 
 
@@ -90,82 +109,28 @@ def _date_min(days: int) -> str:
     return (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
 
 
-def _fetch_stats(days: int) -> dict:
-    """Stats globales pour la home : count AO, count pépites par profil."""
-    date_min = _date_min(days)
-
-    # Count AO dans la fenêtre
-    ao_resp = (_supabase.table("boamp_ao")
-               .select("idweb", count="exact")
-               .gte("dateparution", date_min)
-               .execute())
-    n_ao = ao_resp.count or 0
-
-    # Count pépites par profil (jointure pour respecter la fenêtre AO)
-    profiles_stats = []
-    for prof_name in PROFILES.keys():
-        # On récupère les idweb pépites du profil, puis on filtre côté DB via la jointure implicite
-        # via une requête sur match avec select imbriqué sur boamp_ao pour respecter la fenêtre.
-        resp = (_supabase.table("match")
-                .select("ao_idweb, llm_score, boamp_ao!inner(dateparution)")
-                .eq("profile_name", prof_name)
-                .eq("is_pepite", True)
-                .gte("boamp_ao.dateparution", date_min)
-                .execute())
-        rows = resp.data or []
-        profiles_stats.append({
-            "name": prof_name,
-            "n_pepites": len(rows),
-        })
-
-    return {
-        "window_days": days,
-        "n_ao_total": n_ao,
-        "profiles": profiles_stats,
-        "computed_at": datetime.utcnow().isoformat() + "Z",
-    }
+def _client_ip(req: Request) -> str:
+    # Render met la vraie IP dans X-Forwarded-For
+    fwd = req.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return req.client.host if req.client else "unknown"
 
 
-def _fetch_pepites(profile_name: str, days: int, min_score: int) -> list[dict]:
-    """Retourne les pépites d'un profil avec leur AO joint, triées par score."""
-    if profile_name not in PROFILES:
-        raise HTTPException(status_code=404, detail=f"Profil inconnu : {profile_name}")
+# ---------- Schémas Pydantic ----------
+class MatchRequest(BaseModel):
+    profile_description: str = Field(..., min_length=100, max_length=3000)
+    days: int = Field(default=7)
 
-    date_min = _date_min(days)
-    resp = (_supabase.table("match")
-            .select("llm_score, llm_reason, embedding_sim, computed_at, "
-                    "boamp_ao!inner(idweb, objet, description, acheteur, "
-                    "code_departement, dateparution, datelimitereponse, "
-                    "descripteur_code, descripteur_libelle, url)")
-            .eq("profile_name", profile_name)
-            .eq("is_pepite", True)
-            .gte("llm_score", min_score)
-            .gte("boamp_ao.dateparution", date_min)
-            .order("llm_score", desc=True)
-            .execute())
-
-    out = []
-    for row in resp.data or []:
-        ao = row.get("boamp_ao") or {}
-        out.append({
-            "score": row["llm_score"],
-            "reason": row["llm_reason"],
-            "similarity": round(float(row["embedding_sim"]), 3),
-            "idweb": ao.get("idweb"),
-            "objet": ao.get("objet"),
-            "description": (ao.get("description") or "")[:800],
-            "acheteur": ao.get("acheteur"),
-            "code_departement": ao.get("code_departement"),
-            "dateparution": ao.get("dateparution"),
-            "datelimitereponse": ao.get("datelimitereponse"),
-            "descripteur_code": ao.get("descripteur_code"),
-            "descripteur_libelle": ao.get("descripteur_libelle"),
-            "url": ao.get("url"),
-        })
-    return out
+    @field_validator("days")
+    @classmethod
+    def _validate_days(cls, v):
+        if v not in (3, 7, 30):
+            raise ValueError("days doit valoir 3, 7 ou 30")
+        return v
 
 
-# ---------- Endpoints ----------
+# ---------- Endpoints simples ----------
 @app.get("/health")
 def health():
     return {"status": "ok", "at": datetime.utcnow().isoformat() + "Z"}
@@ -173,7 +138,7 @@ def health():
 
 @app.get("/profiles")
 def get_profiles():
-    """Liste des profils démo avec leur description (pour la sidebar du dashboard)."""
+    """Profils démo hardcodés (utile pour le sélecteur d'exemples côté front)."""
     return [
         {
             "name": name,
@@ -186,25 +151,106 @@ def get_profiles():
 
 @app.get("/stats")
 def get_stats(days: int = Query(7, ge=1, le=90)):
-    """Chiffres pour la home : nb AO scannés, pépites par profil."""
+    """Chiffres du dataset BOAMP (nb AO en base sur la fenêtre) — pour la home."""
     key = f"stats:{days}"
     cached = CACHE.get(key)
     if cached is not None:
         return cached
-    data = _fetch_stats(days)
-    CACHE.set(key, data)
+
+    date_min = _date_min(days)
+    ao_resp = (_supabase.table("boamp_ao")
+               .select("idweb", count="exact")
+               .gte("dateparution", date_min)
+               .execute())
+    data = {
+        "window_days": days,
+        "n_ao_total": ao_resp.count or 0,
+        "computed_at": datetime.utcnow().isoformat() + "Z",
+    }
+    CACHE.set(key, data, ttl=300)
     return data
 
 
-@app.get("/pepites/{profile_name}")
-def get_pepites(profile_name: str,
-                days: int = Query(7, ge=1, le=90),
-                min_score: int = Query(70, ge=0, le=100)):
-    """Pépites d'un profil sur les derniers `days` jours, score LLM >= min_score."""
-    key = f"pepites:{profile_name}:{days}:{min_score}"
-    cached = CACHE.get(key)
+# ---------- Endpoint principal : matching à la volée ----------
+@app.post("/match")
+def match(payload: MatchRequest, request: Request):
+    """
+    Matching sémantique en direct :
+      1. Embed la description libre
+      2. Recherche pgvector top-20 sur la fenêtre
+      3. LLM re-rank
+      4. Filtre par seuil (par défaut 70)
+    """
+    ip = _client_ip(request)
+    ok, retry_after = MATCH_LIMITER.check_and_add(ip)
+    if not ok:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Limite atteinte (5 analyses/heure). Réessayez dans {retry_after // 60} min.",
+        )
+
+    # Cache : mêmes params exacts = même réponse pendant 5 min
+    desc = payload.profile_description.strip()
+    cache_key = "match:" + sha256(f"{desc}|{payload.days}".encode()).hexdigest()
+    cached = CACHE.get(cache_key)
     if cached is not None:
+        log.info("Cache hit (ip=%s, days=%d)", ip, payload.days)
         return cached
-    data = _fetch_pepites(profile_name, days, min_score)
-    CACHE.set(key, data)
-    return data
+
+    t0 = time.time()
+    log.info("Match start (ip=%s, days=%d, desc_len=%d)", ip, payload.days, len(desc))
+
+    # 1. Embed profil
+    prof_vec = embed_texts([desc])[0]
+
+    # 2. Recherche pgvector
+    date_min = _date_min(payload.days)
+    candidates = match_ao_by_embedding(prof_vec, date_min, top_k=20)
+
+    # 3. Comptage total AO dans la fenêtre (pour affichage)
+    n_ao_resp = (_supabase.table("boamp_ao")
+                 .select("idweb", count="exact")
+                 .gte("dateparution", date_min)
+                 .execute())
+    n_ao_scanned = n_ao_resp.count or 0
+    
+    # 4. LLM re-rank en parallèle
+    reranked = rerank_llm_from_db_candidates(desc, candidates, max_workers=8)
+
+    # 5. Filtre pépites
+    pepites_raw = [
+        r for r in reranked
+        if r["llm_score"] >= DEFAULT_NOTIF_THRESHOLD and not r.get("llm_error")
+    ]
+
+    pepites = [{
+        "score": r["llm_score"],
+        "reason": r["llm_reason"],
+        "similarity": round(float(r["similarity"]), 3),
+        "idweb": r["idweb"],
+        "objet": r["objet"],
+        "description": (r.get("description") or "")[:500],
+        "acheteur": r.get("acheteur"),
+        "code_departement": r.get("code_departement"),
+        "dateparution": r.get("dateparution"),
+        "datelimitereponse": r.get("datelimitereponse"),
+        "descripteur_code": r.get("descripteur_code"),
+        "descripteur_libelle": r.get("descripteur_libelle"),
+        "url": r["url"],
+    } for r in pepites_raw]
+
+    response = {
+        "computed_at": datetime.utcnow().isoformat() + "Z",
+        "window_days": payload.days,
+        "n_ao_scanned": n_ao_scanned,
+        "n_candidates_reranked": len(reranked),
+        "n_pepites": len(pepites),
+        "threshold": DEFAULT_NOTIF_THRESHOLD,
+        "duration_seconds": round(time.time() - t0, 2),
+        "pepites": pepites,
+    }
+
+    CACHE.set(cache_key, response, ttl=300)
+    log.info("Match done (ip=%s, %d pépites, %.1fs)",
+             ip, len(pepites), response["duration_seconds"])
+    return response
