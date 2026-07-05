@@ -183,3 +183,60 @@ def match_ao_by_embedding(profile_embedding: np.ndarray,
         "top_k": top_k,
     }).execute()
     return resp.data
+
+def get_last_successful_ingestion() -> dict | None:
+    """Retourne le dernier ingestion réussi, ou None si aucun."""
+    resp = (_client.table("ingestion_log")
+            .select("*")
+            .eq("status", "success")
+            .order("finished_at", desc=True)
+            .limit(1)
+            .execute())
+    return resp.data[0] if resp.data else None
+
+
+def start_ingestion_log(days_back: int) -> int:
+    """Crée une ligne 'running' et retourne son id."""
+    resp = (_client.table("ingestion_log")
+            .insert({"days_back": days_back, "status": "running"})
+            .execute())
+    return resp.data[0]["id"]
+
+
+def finish_ingestion_log(log_id: int, n_new: int, n_updated: int) -> None:
+    _client.table("ingestion_log").update({
+        "status": "success",
+        "finished_at": "now()",
+        "n_new_ao": n_new,
+        "n_updated_ao": n_updated,
+    }).eq("id", log_id).execute()
+
+
+def fail_ingestion_log(log_id: int, error: str) -> None:
+    _client.table("ingestion_log").update({
+        "status": "failed",
+        "finished_at": "now()",
+        "error": error[:500],
+    }).eq("id", log_id).execute()
+
+def get_and_increment_daily_counter(max_per_day: int) -> tuple[bool, int]:
+    """
+    Incrémente le compteur global du jour et retourne (autorisé, valeur_après_incrémentation).
+    """
+    from datetime import date
+    today = date.today().isoformat()
+    # Fetch current
+    resp = (_client.table("rate_limit_global")
+            .select("n_matches")
+            .eq("day", today)
+            .execute())
+    current = resp.data[0]["n_matches"] if resp.data else 0
+    if current >= max_per_day:
+        return False, current
+    # Upsert incrémenté
+    new_value = current + 1
+    _client.table("rate_limit_global").upsert(
+        {"day": today, "n_matches": new_value},
+        on_conflict="day"
+    ).execute()
+    return True, new_value
