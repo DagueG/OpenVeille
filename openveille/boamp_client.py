@@ -62,9 +62,24 @@ def fetch_recent_ao(days_back: int = 7,
             if max_records and len(enriched) >= max_records:
                 break
 
+    # Déduplication par idweb (BOAMP publie parfois plusieurs versions
+    # d'un même avis dans une même fenêtre — rectifications, republications).
+    # On garde la dernière occurrence (la plus récente dans le tri DESC).
+    seen = set()
+    deduped = []
+    n_dups = 0
+    for ao in enriched:
+        if ao["idweb"] in seen:
+            n_dups += 1
+            continue
+        seen.add(ao["idweb"])
+        deduped.append(ao)
+    if n_dups:
+        log.info("Déduplication : %d doublons idweb retirés", n_dups)
+
     log.info("BOAMP filtré : %d AO retenus (desc >= %d chars) sur %d bruts",
-             len(enriched), min_desc_length, len(all_raw))
-    return enriched
+             len(deduped), min_desc_length, len(all_raw))
+    return deduped
 
 def _parse_record(rec: dict) -> dict | None:
     """Extrait un dict AO propre depuis un record BOAMP brut."""

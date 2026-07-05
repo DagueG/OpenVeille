@@ -149,3 +149,33 @@ def rerank_llm(profile_text: str,
     for rank, ao in enumerate(out, 1):
         ao["llm_rank"] = rank
     return out
+
+def rerank_llm_from_db_candidates(profile_text: str,
+                                   candidates: list[dict],
+                                   max_workers: int = LLM_MAX_WORKERS) -> list[dict]:
+    """
+    Re-rank LLM sur des candidats venant de la RPC match_ao_by_embedding.
+    Format d'entrée : dicts avec idweb, objet, description, similarity, etc.
+    Sortie triée par llm_score desc.
+    """
+    log.info("LLM re-rank sur %d candidats DB (parallèle, %d workers)...",
+             len(candidates), max_workers)
+    t_start = time.time()
+
+    def _process(cand):
+        score, reason, err = _rerank_one(
+            profile_text, cand["objet"], (cand.get("description") or "")[:1500]
+        )
+        return {**cand, "llm_score": score, "llm_reason": reason, "llm_error": err}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        out = list(ex.map(_process, candidates))
+
+    n_err = sum(1 for a in out if a["llm_error"])
+    log.info("LLM re-rank terminé en %.1fs (%d erreurs)",
+             time.time() - t_start, n_err)
+
+    out.sort(key=lambda x: x["llm_score"], reverse=True)
+    for rank, ao in enumerate(out, 1):
+        ao["llm_rank"] = rank
+    return out

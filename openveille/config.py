@@ -27,3 +27,7 @@ LLM_MAX_WORKERS = 5             # parallélisme du re-rank LLM
 
 # Chemins
 OUT_DIR = Path("out")
+
+# Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
